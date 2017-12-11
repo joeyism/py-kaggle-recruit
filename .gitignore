@@ -4,3 +4,5 @@ spark-warehouse/
 warehouse
 spark-warehouse/
 derby.log
+submission_files/
+*.swp

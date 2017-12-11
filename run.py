@@ -1,8 +1,10 @@
 from os import listdir
 from os.path import isfile, join
 from pyspark.sql import functions
-from pyspark.sql.functions import *
-from pyspark.sql.types import *
+from pyspark.sql.types import IntegerType, BooleanType
+from pyspark.sql.functions import unix_timestamp, udf, col
+from pyspark.ml.regression import GBTRegressor
+from pyspark.ml.linalg import DenseVector
 
 sqlContext = SQLContext(sc)
 
@@ -26,13 +28,20 @@ def extracttime(df, header, time_suffix = "_datetime"):
 
 d = readFiles("data/")
 
-d["store_info"] = d["store_id_relation"].join(d["hpg_store_info"], d["hpg_store_info"]["hpg_store_id"] == d["store_id_relation"]["hpg_store_id"], "inner").join(d["air_store_info"], d["air_store_info"]["air_store_id"] == d["store_id_relation"]["air_store_id"], "inner")
+# Transform date_info to month day to be joined later
+d["date_info"] = extracttime(d["date_info"], "calendar", time_suffix="_date")
 
+
+# One giant store_info with info from both side
+d["store_info"] = d["store_id_relation"].join(d["hpg_store_info"], "hpg_store_id", "inner").join(d["air_store_info"], "air_store_id", "inner")
+
+# Join date_info to see which days are holidays
 d["air_reserve"] = extracttime(extracttime(d["air_reserve"], "reserve"), "visit")
-d["air_reserve"] = d["air_reserve"].join(d["date_info"], d["air_reserve"]["visit_datetime"] == d["date_info"]["calendar_date"], "inner")
+d["air_reserve"] = d["air_reserve"].join(d["date_info"], [d["air_reserve"]["visit_day"] == d["date_info"]["calendar_day"], d["air_reserve"]["visit_month"] == d["date_info"]["calendar_month"]], "left")
 d["hpg_reserve"] = extracttime(extracttime(d["hpg_reserve"], "reserve"), "visit")
-d["hpg_reserve"] = d["hpg_reserve"].join(d["date_info"], d["hpg_reserve"]["visit_datetime"] == d["date_info"]["calendar_date"], "inner")
+d["hpg_reserve"] = d["hpg_reserve"].join(d["date_info"], [d["hpg_reserve"]["visit_day"] == d["date_info"]["calendar_day"], d["hpg_reserve"]["visit_month"] == d["date_info"]["calendar_month"]], "left")
 
+# Break genre into numbers
 hpg_genre_dict = dict(d["store_info"].select("hpg_genre_name").rdd.distinct().map(lambda r: r[0]).zipWithIndex().collect())
 air_genre_dict = dict(d["store_info"].select("air_genre_name").rdd.distinct().map(lambda r: r[0]).zipWithIndex().collect())
 
@@ -58,6 +67,36 @@ air_store_visit_agg = d["air_visit_data"].groupBy("air_store_id").agg(
 air_store_visit_extra_agg = d["air_visit_data"].groupBy(["air_store_id", "visit_weekend"]).agg(
     functions.avg("visitors").alias("avg_no_of_visitors_weekend"),
     functions.sum("visitors").alias("no_of_visitors_weekend")
-).where(col("visit_weekend") == 1)
-air_store_visit_agg = air_store_visit_agg.join(air_store_visit_extra_agg, air_store_visit_agg["air_store_id"] == air_store_visit_extra_agg["air_store_id"], "inner")
+)
+air_store_visit_agg = air_store_visit_agg.join(air_store_visit_extra_agg, "air_store_id", "inner")
 
+
+d["air_reserve"] = d["air_reserve"].join(air_store_visit_agg, ["air_store_id", "visit_weekend"], "inner")
+
+# Input
+d["input"] = d["air_reserve"].select("reserve_visitors", "visit_weekend", "visit_dotw", "visit_day", "visit_month", "visit_hour", "avg_no_of_visitors", "no_of_visits", "total_no_of_visitors", "no_of_visits_weekend", "avg_no_of_visitors_weekend", "no_of_visitors_weekend")
+d["train_data"] = d["input"].rdd.map(lambda x: (x[0], DenseVector(x[1:])))
+d["input_train"] = spark.createDataFrame(d["train_data"], ["label", "features"])
+
+
+# Sample Submission
+d["sample_submission"] = d["sample_submission"].withColumn("air_store_id", udf(lambda x: "_".join(x.split("_")[0:2]))("id"))
+d["sample_submission"] =d["sample_submission"].withColumn("visit_time", udf(lambda x: x.split("_")[2])("id")).select("*", col("visit_time").cast("timestamp").alias("visit_datetime"))
+d["sample_submission"] = extracttime(d["sample_submission"], "visit")
+d["sample_submission"] = d["sample_submission"].join(air_store_visit_agg, ["air_store_id", "visit_weekend"], "inner")
+d["test"] = d["sample_submission"].select("id", "visit_weekend", "visit_dotw", "visit_day", "visit_month", "visit_hour", "avg_no_of_visitors", "no_of_visits", "total_no_of_visitors", "no_of_visits_weekend", "avg_no_of_visitors_weekend", "no_of_visitors_weekend")
+d["test_data"] = d["test"].rdd.map(lambda x: (x[0], DenseVector(x[1:])))
+d["input_test"] = spark.createDataFrame(d["test_data"], ["id", "features"])
+
+
+
+
+
+
+# GBT
+gbt = GBTRegressor(maxIter=10)
+model = gbt.fit(d["input_train"])
+prediction = model.transform(d["input_test"])
+prediction = prediction.withColumn("visitors", udf(lambda x: int(x))("prediction").cast(IntegerType())).select("id", "visitors")
+prediction.write.csv("submission_files")
+#prediction.coalesce(1).write.format("com.databricks.spark.csv").save("submission")
