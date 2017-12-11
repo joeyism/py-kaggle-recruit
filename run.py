@@ -3,8 +3,12 @@ from os.path import isfile, join
 from pyspark.sql import functions
 from pyspark.sql.types import IntegerType, BooleanType
 from pyspark.sql.functions import unix_timestamp, udf, col
-from pyspark.ml.regression import GBTRegressor
+from pyspark.ml.regression import GBTRegressor, GBTRegressionModel
+from pyspark.ml.evaluation import RegressionEvaluator
 from pyspark.ml.linalg import DenseVector
+from pyspark.ml.tuning import ParamGridBuilder, TrainValidationSplit
+
+import numpy as np
 
 sqlContext = SQLContext(sc)
 
@@ -92,11 +96,26 @@ d["input_test"] = spark.createDataFrame(d["test_data"], ["id", "features"])
 
 
 
-
 # GBT
 gbt = GBTRegressor(maxIter=10)
-model = gbt.fit(d["input_train"])
+
+# Hyperparameter Tuning
+paramGrid = ParamGridBuilder()\
+        .addGrid(gbt.subsamplingRate, np.arange(0.1, 1.1, 0.1))\
+        .addGrid(gbt.stepSize, np.arange(0.1, 1.1, 0.1))\
+        .build()
+tvs = TrainValidationSplit(
+    estimator=gbt,
+    estimatorParamMaps=paramGrid,
+    evaluator=RegressionEvaluator(),
+    trainRatio=0.8
+)
+model = tvs.fit(d["input_train"])
+
+break
+
 prediction = model.transform(d["input_test"])
-prediction = prediction.withColumn("visitors", udf(lambda x: int(x))("prediction").cast(IntegerType())).select("id", "visitors")
-prediction.write.csv("submission_files")
+prediction = prediction.withColumn("visitors", udf(lambda x: int(x) if x > 0 else 0)("prediction").cast(IntegerType())).select("id", "visitors")
+prediction.toPandas().to_csv("submission.csv", index=False)
+#prediction.write.csv("submission_files")
 #prediction.coalesce(1).write.format("com.databricks.spark.csv").save("submission")
