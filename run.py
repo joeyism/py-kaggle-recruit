@@ -1,6 +1,7 @@
 from os import listdir
 from os.path import isfile, join
-from pyspark.sql import functions
+from pyspark import SparkConf, SparkContext
+from pyspark.sql import functions, SQLContext
 from pyspark.sql.types import IntegerType, BooleanType
 from pyspark.sql.functions import unix_timestamp, udf, col
 from pyspark.ml.regression import GBTRegressor, GBTRegressionModel
@@ -9,6 +10,11 @@ from pyspark.ml.linalg import DenseVector
 from pyspark.ml.tuning import ParamGridBuilder, TrainValidationSplit
 
 import numpy as np
+
+sc = SparkContext(appName="recruit")
+
+
+
 
 sqlContext = SQLContext(sc)
 
@@ -54,12 +60,19 @@ global_air_genre_dict = sc.broadcast(air_genre_dict)
 hpg_genre_udf = udf(lambda x: global_hpg_genre_dict.value[x])
 air_genre_udf = udf(lambda x: global_air_genre_dict.value[x])
 
-d["store_info"] = d["store_info"].withColumn("hpg_genre_id", hpg_genre_udf("hpg_genre_name"))
-d["store_info"] = d["store_info"].withColumn("air_genre_id", air_genre_udf("air_genre_name"))
+d["store_info"] = d["store_info"].withColumn("hpg_genre_id", hpg_genre_udf("hpg_genre_name").cast(IntegerType()))
+d["store_info"] = d["store_info"].withColumn("air_genre_id", air_genre_udf("air_genre_name").cast(IntegerType()))
+
+# Break area into numbers
+air_area_dict = dict(d["store_info"].select("air_area_name").rdd.distinct().map(lambda r: r[0]).zipWithIndex().collect())
+global_air_area_dict = sc.broadcast(air_area_dict)
+air_area_udf = udf(lambda x: global_air_area_dict.value[x])
+d["store_info"] = d["store_info"].withColumn("air_area_id", air_area_udf("air_area_name").cast(IntegerType()))
 
 
 # Aggregate visits for each store
 d["air_visit_data"] = extracttime(d["air_visit_data"], "visit", time_suffix="_date")
+
 
 air_store_visit_agg = d["air_visit_data"].groupBy("air_store_id").agg(
     functions.mean("visitors").alias("avg_no_of_visitors"),
@@ -74,11 +87,16 @@ air_store_visit_extra_agg = d["air_visit_data"].groupBy(["air_store_id", "visit_
 )
 air_store_visit_agg = air_store_visit_agg.join(air_store_visit_extra_agg, "air_store_id", "inner")
 
+# Join with aggregates
+d["air_reserve"] = d["air_reserve"].join(air_store_visit_agg, ["air_store_id", "visit_weekend"], "inner").join(d["store_info"], "air_store_id", "left")
 
-d["air_reserve"] = d["air_reserve"].join(air_store_visit_agg, ["air_store_id", "visit_weekend"], "inner")
 
+
+##### Getting train and test data
+#
+#
 # Input
-d["input"] = d["air_reserve"].select("reserve_visitors", "visit_weekend", "visit_dotw", "visit_day", "visit_month", "visit_hour", "avg_no_of_visitors", "no_of_visits", "total_no_of_visitors", "no_of_visits_weekend", "avg_no_of_visitors_weekend", "no_of_visitors_weekend")
+d["input"] = d["air_reserve"].select("reserve_visitors", "visit_weekend", "visit_dotw", "visit_day", "visit_month", "avg_no_of_visitors", "no_of_visits", "total_no_of_visitors", "no_of_visits_weekend", "avg_no_of_visitors_weekend", "no_of_visitors_weekend", "air_area_id")
 d["train_data"] = d["input"].rdd.map(lambda x: (x[0], DenseVector(x[1:])))
 d["input_train"] = spark.createDataFrame(d["train_data"], ["label", "features"])
 
@@ -87,8 +105,8 @@ d["input_train"] = spark.createDataFrame(d["train_data"], ["label", "features"])
 d["sample_submission"] = d["sample_submission"].withColumn("air_store_id", udf(lambda x: "_".join(x.split("_")[0:2]))("id"))
 d["sample_submission"] =d["sample_submission"].withColumn("visit_time", udf(lambda x: x.split("_")[2])("id")).select("*", col("visit_time").cast("timestamp").alias("visit_datetime"))
 d["sample_submission"] = extracttime(d["sample_submission"], "visit")
-d["sample_submission"] = d["sample_submission"].join(air_store_visit_agg, ["air_store_id", "visit_weekend"], "inner")
-d["test"] = d["sample_submission"].select("id", "visit_weekend", "visit_dotw", "visit_day", "visit_month", "visit_hour", "avg_no_of_visitors", "no_of_visits", "total_no_of_visitors", "no_of_visits_weekend", "avg_no_of_visitors_weekend", "no_of_visitors_weekend")
+d["sample_submission"] = d["sample_submission"].join(air_store_visit_agg, ["air_store_id", "visit_weekend"], "inner").join(d["store_info"], "air_store_id", "left")
+d["test"] = d["sample_submission"].select("id", "visit_weekend", "visit_dotw", "visit_day", "visit_month", "avg_no_of_visitors", "no_of_visits", "total_no_of_visitors", "no_of_visits_weekend", "avg_no_of_visitors_weekend", "no_of_visitors_weekend", "air_area_id")
 d["test_data"] = d["test"].rdd.map(lambda x: (x[0], DenseVector(x[1:])))
 d["input_test"] = spark.createDataFrame(d["test_data"], ["id", "features"])
 
@@ -112,7 +130,6 @@ tvs = TrainValidationSplit(
 )
 model = tvs.fit(d["input_train"])
 
-break
 
 prediction = model.transform(d["input_test"])
 prediction = prediction.withColumn("visitors", udf(lambda x: int(x) if x > 0 else 0)("prediction").cast(IntegerType())).select("id", "visitors")
